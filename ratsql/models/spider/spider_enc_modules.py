@@ -4,11 +4,12 @@ import operator
 import numpy as np
 import torch
 from torch import nn
-
+import torchtext
 from ratsql.models import transformer
 from ratsql.models import variational_lstm
 from ratsql.utils import batched_sequence
 
+import random
 
 def clamp(value, abs_max):
     value = max(-abs_max, value)
@@ -309,6 +310,9 @@ class RelationalTransformerUpdate(torch.nn.Module):
                  tt_foreign_key=True,
                  sc_link=False,
                  cv_link=False,
+                 cv_token_link=False,
+                 cv_token_start_link=False,
+                 original_bert_config=None
                  ):
         super().__init__()
         self._device = device
@@ -329,6 +333,8 @@ class RelationalTransformerUpdate(torch.nn.Module):
         self.tt_max_dist = tt_max_dist
         self.tt_foreign_key = tt_foreign_key
 
+        self.cv_token_start_link = cv_token_start_link
+        self.cv_link = cv_link
         self.relation_ids = {}
 
         def add_relation(name):
@@ -406,6 +412,18 @@ class RelationalTransformerUpdate(torch.nn.Module):
             add_relation("cqTIME")
             add_relation("qcCELLMATCH")
             add_relation("cqCELLMATCH")
+            if cv_token_link:
+                add_relation("qcCELLTOKENMATCH")
+                add_relation("cqCELLTOKENMATCH")
+            else:
+                self.relation_ids['qcCELLTOKENMATCH'] = self.relation_ids['qcCELLMATCH']
+                self.relation_ids['cqCELLTOKENMATCH'] = self.relation_ids['cqCELLMATCH']
+            if cv_token_start_link:
+                add_relation("qcCELLMATCHSTART")
+                add_relation("cqCELLMATCHSTART")
+            else:
+                self.relation_ids['qcCELLMATCHSTART'] = self.relation_ids['qcCELLMATCH']
+                self.relation_ids['cqCELLMATCHSTART'] = self.relation_ids['cqCELLMATCH']
 
         if merge_types:
             assert not cc_foreign_key
@@ -452,25 +470,27 @@ class RelationalTransformerUpdate(torch.nn.Module):
 
         if ff_size is None:
             ff_size = hidden_size * 4
+        num_relations = len(set([r_id for _,r_id in self.relation_ids.items()]))
         self.encoder = transformer.Encoder(
             lambda: transformer.EncoderLayer(
                 hidden_size,
                 transformer.MultiHeadedAttentionWithRelations(
                     num_heads,
                     hidden_size,
-                    dropout),
+                    original_bert_config.attention_probs_dropout_prob),
                 transformer.PositionwiseFeedForward(
                     hidden_size,
                     ff_size,
-                    dropout),
-                len(self.relation_ids),
-                dropout),
+                    original_bert_config.hidden_dropout_prob),
+                num_relations,
+                original_bert_config.hidden_dropout_prob),
             hidden_size,
             num_layers,
             tie_layers)
 
         self.align_attn = transformer.PointerWithRelations(hidden_size,
-                                                           len(self.relation_ids), dropout)
+            num_relations, original_bert_config.attention_probs_dropout_prob)
+        self.dropout = torch.nn.Dropout(original_bert_config.hidden_dropout_prob)
 
     def create_align_mask(self, num_head, q_length, c_length, t_length):
         # mask with size num_heads * all_len * all * len
@@ -484,7 +504,7 @@ class RelationalTransformerUpdate(torch.nn.Module):
         mask = torch.cat([mask_1, mask_2], 0)
         return mask
 
-    def forward_unbatched(self, desc, q_enc, c_enc, c_boundaries, t_enc, t_boundaries):
+    def forward_unbatched(self, desc, q_enc, c_enc, c_boundaries, t_enc, t_boundaries, masked_columns):
         # enc shape: total len x batch (=1) x recurrent size
         enc = torch.cat((q_enc, c_enc, t_enc), dim=0)
 
@@ -498,11 +518,11 @@ class RelationalTransformerUpdate(torch.nn.Module):
             q_enc_length=q_enc.shape[0],
             c_enc_length=c_enc.shape[0],
             c_boundaries=c_boundaries,
-            t_boundaries=t_boundaries)
-
+            t_boundaries=t_boundaries,
+            masked_columns=masked_columns)
         relations_t = torch.LongTensor(relations).to(self._device)
         enc_new = self.encoder(enc, relations_t, mask=None)
-
+        enc_new = self.dropout(enc_new)
         # Split updated_enc again
         c_base = q_enc.shape[0]
         t_base = q_enc.shape[0] + c_enc.shape[0]
@@ -514,7 +534,7 @@ class RelationalTransformerUpdate(torch.nn.Module):
                                         enc_new[:, c_base:t_base], relations_t[:, c_base:t_base])
         m2t_align_mat = self.align_attn(enc_new, enc_new[:, t_base:], \
                                         enc_new[:, t_base:], relations_t[:, t_base:])
-        return q_enc_new, c_enc_new, t_enc_new, (m2c_align_mat, m2t_align_mat)
+        return q_enc_new, c_enc_new, t_enc_new, (m2c_align_mat, m2t_align_mat), relations_t
 
     def forward(self, descs, q_enc, c_enc, c_boundaries, t_enc, t_boundaries):
         # TODO: Update to also compute m2c_align_mat and m2t_align_mat
@@ -566,9 +586,12 @@ class RelationalTransformerUpdate(torch.nn.Module):
             gather_from_indices=gather_from_enc_new)
         return q_enc_new, c_enc_new, t_enc_new
 
-    def compute_relations(self, desc, enc_length, q_enc_length, c_enc_length, c_boundaries, t_boundaries):
+    def compute_relations(self, desc, enc_length, q_enc_length, c_enc_length, c_boundaries, t_boundaries, masked_columns):
         sc_link = desc.get('sc_link', {'q_col_match': {}, 'q_tab_match': {}})
-        cv_link = desc.get('cv_link', {'num_date_match': {}, 'cell_match': {}})
+        if self.cv_link:
+            cv_link = desc.get('cv_link', {'num_date_match': {}, 'cell_match': {}})
+        else:
+            cv_link = {"num_date_match": {}, "cell_match": {}}
 
         # Catalogue which things are where
         loc_types = {}
@@ -597,7 +620,7 @@ class RelationalTransformerUpdate(torch.nn.Module):
                 elif j_type[0] == 'column':
                     # set_relation('qc_default')
                     j_real = j - c_base
-                    if f"{i},{j_real}" in sc_link["q_col_match"]:
+                    if f"{i},{j_real}" in sc_link["q_col_match"] and j_real not in masked_columns:
                         set_relation("qc" + sc_link["q_col_match"][f"{i},{j_real}"])
                     elif f"{i},{j_real}" in cv_link["cell_match"]:
                         set_relation("qc" + cv_link["cell_match"][f"{i},{j_real}"])
@@ -617,7 +640,7 @@ class RelationalTransformerUpdate(torch.nn.Module):
                 if j_type[0] == 'question':
                     # set_relation('cq_default')
                     i_real = i - c_base
-                    if f"{j},{i_real}" in sc_link["q_col_match"]:
+                    if f"{j},{i_real}" in sc_link["q_col_match"] and i_real not in masked_columns:
                         set_relation("cq" + sc_link["q_col_match"][f"{j},{i_real}"])
                     elif f"{j},{i_real}" in cv_link["cell_match"]:
                         set_relation("cq" + cv_link["cell_match"][f"{j},{i_real}"])
