@@ -1,0 +1,46 @@
+{
+    local exp_id = 0,
+    logdir: "logs/bert_value_run_%d" %exp_id,
+    model_config: "codalab_exp/exp/val.jsonnet",
+    model_config_args: {
+        data_path: 'tmpdata/',
+        db_path: 'database/',
+        bs: 8,
+        num_batch_accumulated: 3,
+        bert_version: "bert-large-uncased-whole-word-masking",
+        summarize_header: "avg",
+        use_column_type: false,
+        use_column_value: false,
+        num_layers: 8,
+        lr: 7.44e-4,
+        bert_lr: 3e-6,
+        att: 1,
+        warmup_frac: 8,
+        end_lr: 0,
+        sc_link: true,
+        cv_link: true,
+        cv_token_start_link: true,
+        cv_token_link: true,
+        use_align_mat: true,
+        use_align_loss: true,
+        use_encoder_action: false,
+        bert_token_type: true,
+        decoder_hidden_size: 512,
+        end_with_from: true, # equivalent to "SWGOIF" if true
+        clause_order: null, # strings like "SWGOIF", it will be prioriotized over end_with_from 
+        local_pretrained: null,
+        mask_column: -1,
+        use_bert_subtask_loss: false,
+        use_rat_subtask_loss: false,
+        bert_subtask_loss_weight: 1,
+        rat_subtask_loss_weight: 1,
+        dec_min_freq: 10
+    },
+
+    eval_name: "val",
+    eval_output: "logdirs",
+    eval_beam_size: 1,
+    eval_use_heuristic: 0,
+    eval_steps: [40000],
+    eval_sections: ["val"]
+}
