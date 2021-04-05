@@ -6,19 +6,26 @@ import os
 import attr
 import numpy as np
 import torch
-from transformers import BertModel, BertTokenizer
+from transformers import BertModel, BertTokenizer, BertForMaskedLM, AutoModel
 
-from ratsql.models import abstract_preproc
+from ratsql.models import abstract_preproc, transformer
 from ratsql.models.spider import spider_enc_modules
 from ratsql.models.spider.spider_match_utils import (
     compute_schema_linking,
-    compute_cell_value_linking
+    compute_cell_value_linking,
+    compute_cell_value_linking_v1,
+    compute_cell_value_linking_v2
 )
 from ratsql.resources import corenlp
+from ratsql.resources import pretrained_embeddings
 from ratsql.utils import registry
 from ratsql.utils import serialization
 from ratsql.utils import vocab
+from ratsql import resources
 
+import nltk.corpus
+import torchtext
+import random
 
 @attr.s
 class SpiderEncoderState:
@@ -37,6 +44,23 @@ class SpiderEncoderState:
     def find_word_occurrences(self, word):
         return [i for i, w in enumerate(self.words) if w == word]
 
+@attr.s
+class SpiderEncoderStateBert(SpiderEncoderState):
+    question_word_map = attr.ib()
+    question_bert_memory = attr.ib()
+    pointer_bert_memories = attr.ib()
+    relations = attr.ib()
+    relation_ids = attr.ib()
+    bert_pieces = attr.ib()
+    db_id = attr.ib()
+    col_labels = attr.ib()
+    question_labels = attr.ib()
+    column2table = attr.ib()
+    def find_word_occurrences(self, word, use_bert_piece=False):
+        if use_bert_piece:
+            return [i for i, piece in enumerate(self.bert_pieces) if piece == word]
+        else:
+            return self.question_word_map.get(word, [])
 
 @attr.s
 class PreprocessedSchema:
@@ -548,7 +572,8 @@ class Bertokens:
         self.normalized_pieces = None
         self.recovered_pieces = None
         self.idx_map = None
-
+        self.word_map = {}
+        self.word_for_copy = []
         self.normalize_toks()
 
     def normalize_toks(self):
@@ -580,22 +605,39 @@ class Bertokens:
             assert end - start + 1 < 10
             pieces = [self.pieces[start]] + [self.pieces[_id].strip("##") for _id in range(start + 1, end)]
             word = "".join(pieces)
-            combined_word[start] = word
+            combined_word[start] = [word, list(range(start,end))]
 
         # remove "", only keep "abc"
         idx_map = {}
         new_toks = []
+        word_map = {}
+        word2piece_idx_map = {}
         for i, piece in enumerate(self.pieces):
             if i in combined_word:
                 idx_map[len(new_toks)] = i
-                new_toks.append(combined_word[i])
+                word2piece_idx_map[len(new_toks)] = [i]
+                new_toks.append(combined_word[i][0])
+                self.word_for_copy.append(combined_word[i][0].strip("\""))
+                if combined_word[i][0] in word_map:
+                    word_map[combined_word[i][0].strip("\"")] += combined_word[i][1]
+                else:
+                    word_map[combined_word[i][0].strip("\"")] = combined_word[i][1]
             elif i in self.pieces2startidx:
                 # remove it
-                pass
+                word2piece_idx_map[len(new_toks)-1].append(i)
+                self.word_for_copy.append(combined_word[self.pieces2startidx[i]][0].strip("\""))
             else:
                 idx_map[len(new_toks)] = i
+                word2piece_idx_map[len(new_toks)] = [i]
                 new_toks.append(piece)
+                self.word_for_copy.append(piece.strip("\""))
+                if piece in word_map:
+                    word_map[piece.strip("\"")] += [i]
+                else:
+                    word_map[piece.strip("\"")] = [i]
         self.idx_map = idx_map
+        self.word_map = word_map
+        self.word2piece_idx_map = word2piece_idx_map
 
         # lemmatize "abc"
         normalized_toks = []
@@ -613,6 +655,7 @@ class Bertokens:
         column_tokens = [c.normalized_pieces for c in columns]
         table_tokens = [t.normalized_pieces for t in tables]
         sc_link = compute_schema_linking(question_tokens, column_tokens, table_tokens)
+        column2piece = [[] for i in range(len(columns))]
 
         new_sc_link = {}
         for m_type in sc_link:
@@ -620,26 +663,155 @@ class Bertokens:
             for ij_str in sc_link[m_type]:
                 q_id_str, col_tab_id_str = ij_str.split(",")
                 q_id, col_tab_id = int(q_id_str), int(col_tab_id_str)
+                column2piece[col_tab_id] += self.word2piece_idx_map[q_id]
                 real_q_id = self.idx_map[q_id]
                 _match[f"{real_q_id},{col_tab_id}"] = sc_link[m_type][ij_str]
 
             new_sc_link[m_type] = _match
-        return new_sc_link
+        column2piece = [list(set(x)) for x in column2piece]
+        return new_sc_link, column2piece
 
-    def bert_cv_linking(self, schema):
-        question_tokens = self.recovered_pieces  # Not using normalized tokens here because values usually match exactly
-        cv_link = compute_cell_value_linking(question_tokens, schema)
-
-        new_cv_link = {}
-        for m_type in cv_link:
-            _match = {}
-            for ij_str in cv_link[m_type]:
-                q_id_str, col_tab_id_str = ij_str.split(",")
-                q_id, col_tab_id = int(q_id_str), int(col_tab_id_str)
-                real_q_id = self.idx_map[q_id]
-                _match[f"{real_q_id},{col_tab_id}"] = cv_link[m_type][ij_str]
-            new_cv_link[m_type] = _match
-        return new_cv_link
+# utils to get labels for subtasks like column selection and column value mapping
+def get_where_cond(sql):
+    conds = []
+    for unit in sql['where']:
+        if isinstance(unit, list):
+            col = unit[2][1][1]
+            val1 = unit[3]
+            val2 = unit[4]
+            if isinstance(val1, dict):
+                conds += get_where_cond(val1)
+                val1 = None
+            if isinstance(val2, dict):
+                conds += get_where_cond(val2)
+                val2 = None
+            conds.append([col, val1, val2])
+    if sql['intersect'] is not None:
+        conds += get_where_cond(sql['intersect'])
+    if sql['union'] is not None:
+        conds += get_where_cond(sql['union'])
+    if sql['except'] is not None:
+        conds += get_where_cond(sql['except'])
+    return conds
+def get_select_col(sql):
+    return [x[1][1][1] for x in sql['select'][1]]
+def get_orderby_col(sql):
+    cols = []
+    if sql['orderBy']:
+        cols += [x[1][1] for x in sql['orderBy'][1]]
+    if sql['intersect'] is not None:
+        cols += get_orderby_col(sql['intersect'])
+    if sql['union'] is not None:
+        cols += get_orderby_col(sql['union'])
+    if sql['except'] is not None:
+        cols += get_orderby_col(sql['except'])
+    return cols
+def get_groupby_col(sql):
+    cols = []
+    if sql['groupBy']:
+        cols += [x[1] for x in sql['groupBy']]
+    if sql['intersect'] is not None:
+        cols += get_groupby_col(sql['intersect'])
+    if sql['union'] is not None:
+        cols += get_groupby_col(sql['union'])
+    if sql['except'] is not None:
+        cols += get_groupby_col(sql['except'])
+    return cols
+def get_having_cond(sql):
+    conds = []
+    for unit in sql['having']:
+        if isinstance(unit, list):
+            col = unit[2][1][1]
+            val1 = unit[3]
+            val2 = unit[4]
+            if isinstance(val1, dict):
+                conds += get_having_cond(val1)
+                val1 = None
+            if isinstance(val2, dict):
+                conds += get_having_cond(val2)
+                val2 = None
+            conds.append([col, val1, val2])
+    if sql['intersect'] is not None:
+        conds += get_having_cond(sql['intersect'])
+    if sql['union'] is not None:
+        conds += get_having_cond(sql['union'])
+    if sql['except'] is not None:
+        conds += get_having_cond(sql['except'])
+    return conds
+def get_col_labels(cols, sql):
+    select_cols = set(get_select_col(sql))
+    where_conds = get_where_cond(sql)
+    where_cols = set([x[0] for x in where_conds])
+    where_vals = [[x[0],y] for x in where_conds for y in x[1:] if y is not None]
+    orderby_cols = set(get_orderby_col(sql))
+    groupby_cols = set(get_groupby_col(sql))
+    having_conds = get_having_cond(sql)
+    having_cols = set([x[0] for x in having_conds])
+    having_vals = [[x[0],y] for x in having_conds for y in x[1:] if y is not None]
+    col_labels = [[
+        1 if i in select_cols else 0,
+        1 if i in where_cols else 0,
+        1 if i in groupby_cols else 0,
+        1 if i in orderby_cols else 0,
+        1 if i in having_cols else 0
+    ] for i in range(len(cols))]
+    return col_labels, where_vals + having_vals
+def get_token_labels(tokens, vals, tokenizer):
+    def process_val(field_value):
+        if isinstance(field_value, bytes):
+            field_value_str = field_value.encode('latin1')
+        elif isinstance(field_value, str):
+            field_value_str = field_value
+        elif isinstance(field_value, float):
+            if float(field_value) == int(field_value):
+                field_value_str = str(int(field_value))
+            else:
+                field_value_str = str(float(field_value))
+        else:
+            field_value_str = str(field_value)
+        field_value_str = field_value_str.strip("\"")
+        # regualr expression
+        field_value_str = field_value_str.strip("%")
+        return tokenizer.tokenize(field_value_str)
+    def combine_pieces(tokens):
+        normalized_token = ''
+        i = 0
+        words = []
+        while i < len(tokens):
+            if tokens[i].startswith('##'):
+                normalized_token += tokens[i][2:]
+            else:
+                normalized_token += tokens[i]
+            if normalized_token and (i+1 == len(tokens) or not tokens[i+1].startswith('##')):
+                words.append(normalized_token)
+                normalized_token = ''
+            i += 1
+        return ' '.join(words[:5])
+    vals = [[x,process_val(y)] for x,y in vals]
+    col_vals_used = {}
+    for col_id, val in vals:
+        if col_id not in col_vals_used:
+            col_vals_used[col_id] = []
+        col_vals_used[col_id].append(combine_pieces(val))
+    token_labels = []
+    i = 0
+    while len(token_labels)<len(tokens):
+        matched = False
+        for col,val in vals:
+            if tokens[i] == val[0]:
+                if len(val)==len(tokens[i:i+len(val)]) and all([x==y for x,y in zip(val, tokens[i:i+len(val)])]):
+                    token_labels += [col]*len(val)
+                    i += len(val)
+                    matched = True
+                    break
+        if not matched:
+            i += 1
+            token_labels.append(-1)
+    found_cols = set(token_labels)
+    missed_values = [' '.join(val) for col,val in vals if col not in found_cols]
+    if missed_values:
+        print('miss val:', ' '.join(tokens), missed_values)
+    return token_labels, col_vals_used
 
 
 class SpiderEncoderBertPreproc(SpiderEncoderV2Preproc):
@@ -685,26 +857,36 @@ class SpiderEncoderBertPreproc(SpiderEncoderV2Preproc):
         question = self._tokenize(item.text, item.orig['question'])
         preproc_schema = self._preprocess_schema(item.schema)
         question_bert_tokens = Bertokens(question)
+        col_labels, vals = get_col_labels(preproc_schema.normalized_column_names, item.orig['sql']) # is_select, is_where, is_groupby, is_orderby, is_having
+        question_labels, col_vals_used = get_token_labels(question, vals, self.tokenizer)
+        col_vals_used = [col_vals_used.get(i, []) for i in range(len(col_labels))]
         if self.compute_sc_link:
-            sc_link = question_bert_tokens.bert_schema_linking(
+            sc_link, col_sclink_map = question_bert_tokens.bert_schema_linking(
                 preproc_schema.normalized_column_names,
                 preproc_schema.normalized_table_names
             )
         else:
             sc_link = {"q_col_match": {}, "q_tab_match": {}}
+            col_sclink_map = [[] for i in range(len(preproc_schema.normalized_column_names))]
 
         if self.compute_cv_link:
-            cv_link = question_bert_tokens.bert_cv_linking(item.schema)
+            cv_link = compute_cell_value_linking_v2(question_bert_tokens.recovered_pieces, item.schema, question_bert_tokens.idx_map)
         else:
             cv_link = {"num_date_match": {}, "cell_match": {}}
 
         return {
             'raw_question': item.orig['question'],
             'question': question,
+            'question_for_copy':question_bert_tokens.word_for_copy,
+            'question_word_map': question_bert_tokens.word_map,
             'db_id': item.schema.db_id,
             'sc_link': sc_link,
             'cv_link': cv_link,
             'columns': preproc_schema.column_names,
+            'col_sclink_map': col_sclink_map,
+            'col_labels': col_labels,
+            'col_vals_used': col_vals_used,
+            'question_labels': question_labels,
             'tables': preproc_schema.table_names,
             'table_bounds': preproc_schema.table_bounds,
             'column_to_table': preproc_schema.column_to_table,
@@ -722,7 +904,9 @@ class SpiderEncoderBertPreproc(SpiderEncoderV2Preproc):
                     sum(len(c) + 1 for c in preproc_schema.column_names) + \
                     sum(len(t) + 1 for t in preproc_schema.table_names)
         if num_words > 512:
-            return False, None  # remove long sequences
+            return False, (len(question), \
+                        sum(len(c) + 1 for c in preproc_schema.column_names), \
+                        sum(len(t) + 1 for t in preproc_schema.table_names)) # remove long sequences
         else:
             return True, None
 
@@ -762,7 +946,10 @@ class SpiderEncoderBert(torch.nn.Module):
             bert_version="bert-base-uncased",
             summarize_header="first",
             use_column_type=True,
-            include_in_memory=('question', 'column', 'table')):
+            use_column_value=False,
+            include_in_memory=('question', 'column', 'table'),
+            mask_column=-1,
+            local_pretrain_model=''):
         super().__init__()
         self._device = device
         self.preproc = preproc
@@ -773,6 +960,7 @@ class SpiderEncoderBert(torch.nn.Module):
         self.summarize_header = summarize_header
         self.enc_hidden_size = self.base_enc_hidden_size
         self.use_column_type = use_column_type
+        self.use_column_value = use_column_value
 
         self.include_in_memory = set(include_in_memory)
         update_modules = {
@@ -782,6 +970,22 @@ class SpiderEncoderBert(torch.nn.Module):
                 spider_enc_modules.NoOpUpdate,
         }
 
+        # load pretrained model like strug
+        if local_pretrain_model=='':
+            self.bert_lm = BertForMaskedLM.from_pretrained(bert_version)
+            self.bert_model = self.bert_lm.bert
+        else:
+            try:
+                print('try init bert from local dir', local_pretrain_model)
+                self.bert_model = AutoModel.from_pretrained(local_pretrain_model)
+            except:
+                print('fail to load, revert to use', bert_version)
+                self.bert_lm = BertForMaskedLM.from_pretrained(bert_version)
+                self.bert_model = self.bert_lm.bert
+        self.tokenizer = self.preproc.tokenizer
+        self.tokenizer.add_special_tokens({'bos_token':'[unused0]', 'eos_token':'[unused1]', 'unk_token':'[unused2]'})
+        self.bert_model.resize_token_embeddings(len(self.tokenizer)) # several tokens added
+
         self.encs_update = registry.instantiate(
             update_modules[update_config['name']],
             update_config,
@@ -789,33 +993,99 @@ class SpiderEncoderBert(torch.nn.Module):
             device=self._device,
             hidden_size=self.enc_hidden_size,
             sc_link=True,
+            dropout=self.bert_model.config.hidden_dropout_prob,
+            original_bert_config = self.bert_model.config
         )
 
-        self.bert_model = BertModel.from_pretrained(bert_version)
-        self.tokenizer = self.preproc.tokenizer
-        self.bert_model.resize_token_embeddings(len(self.tokenizer))  # several tokens added
-
+        self.mask_column = mask_column
+        self.dropout = torch.nn.Dropout(self.bert_model.config.hidden_dropout_prob)
+        if self.use_column_value:
+            self.fuse_column_value = torch.nn.Sequential(
+                torch.nn.Linear(self.bert_model.config.hidden_size*2, self.bert_model.config.hidden_size),
+                self.dropout,
+                torch.nn.LayerNorm(self.bert_model.config.hidden_size, eps=self.bert_model.config.layer_norm_eps)
+            )
+    
     def forward(self, descs):
         batch_token_lists = []
         batch_id_to_retrieve_question = []
         batch_id_to_retrieve_column = []
         batch_id_to_retrieve_table = []
+        batch_token_pos_list = []
+        if self.use_column_value:
+            batch_col_values = []
         if self.summarize_header == "avg":
             batch_id_to_retrieve_column_2 = []
             batch_id_to_retrieve_table_2 = []
         long_seq_set = set()
         batch_id_map = {}  # some long examples are not included
+        batch_masked_columns = [[] for i in range(len(descs))]
         for batch_idx, desc in enumerate(descs):
             qs = self.pad_single_sentence_for_bert(desc['question'], cls=True)
+            if self.mask_column != -1:
+                col_sclink_map = desc['col_sclink_map']
+                for col_i, col_q_map in enumerate(col_sclink_map):
+                    if col_q_map and any(desc['col_labels'][col_i][1:]) and random.random()<self.mask_column: # is_select, is_where, is_groupby, is_orderby, is_having, only mask column used and is not in select
+                        batch_masked_columns[batch_idx].append(col_i)
+                        for q_i in col_q_map:
+                            qs[1+q_i] = self.tokenizer.pad_token
             if self.use_column_type:
-                cols = [self.pad_single_sentence_for_bert(c, cls=False) for c in desc['columns']]
+                cols = [self.pad_single_sentence_for_bert(c, cls=False, sep=False) for c in desc['columns']]
             else:
-                cols = [self.pad_single_sentence_for_bert(c[:-1], cls=False) for c in desc['columns']]
-            tabs = [self.pad_single_sentence_for_bert(t, cls=False) for t in desc['tables']]
+                cols = [self.pad_single_sentence_for_bert(c[:-1], cls=False, sep=False) for c in desc['columns']]
+            if self.use_column_value:
+                # #old, use all cached values
+                # schema = self.preproc.orig_data.schemas[desc['db_id']]
+                # cols = [c+['[unused5]'] for c in cols]
+                # col_values, masks = self.pad_sequence_simple([col.value_vocab_ids for col in schema.columns], max_l = 512)
+                # for i, col in enumerate(schema.columns):
+                #     col_value_weights = col.value_vocab_weights
+                #     if len(masks[i])<=len(col_value_weights):
+                #         col_value_weights = col_value_weights[:len(masks[i])]
+                #     masks[i][:len(col_value_weights)] = col_value_weights 
+                # masks = torch.FloatTensor(masks).to(self._device)
+                # masks[masks==0] = -10000
+                # masks = torch.softmax(masks, -1)
+                # col_values = torch.LongTensor(col_values).to(self._device)
+                # col_value_embeddings = self.bert_model.embeddings.word_embeddings(col_values)
+                # col_value_reprs = torch.matmul(col_value_embeddings.transpose(1,2),masks[:,:,None]).squeeze()
+                # batch_col_values.append(col_value_reprs)
+                # new, use sampled value with value used removed
+                schema = self.preproc.orig_data.schemas[desc['db_id']]
+                cols = [c+['[unused5]'] for c in cols]
+                sampled_col_values = []
+                for i, col in enumerate(schema.columns):
+                    cell_values = col.cell_values
+                    if len(cell_values) != 0:
+                        unused_cell_values = cell_values-set(desc['col_vals_used'][i])
+                        if len(unused_cell_values)>5:
+                            sampled_cell_values = random.sample(unused_cell_values, 5)
+                        else:
+                            sampled_cell_values = unused_cell_values
+                        sampled_cell_token_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(' '.join(sampled_cell_values)))
+                    else:
+                        sampled_cell_token_ids = col.value_vocab_ids
+                    sampled_col_values.append(sampled_cell_token_ids)
+                col_values, masks = self.pad_sequence_simple(sampled_col_values, max_l = 512)
+                masks = torch.FloatTensor(masks).to(self._device)
+                masks[masks==0] = -10000
+                masks = torch.softmax(masks, -1)
+                col_values = torch.LongTensor(col_values).to(self._device)
+                col_value_embeddings = self.bert_model.embeddings.word_embeddings(col_values)
+                col_value_reprs = torch.matmul(col_value_embeddings.transpose(1,2),masks[:,:,None]).squeeze()
+                batch_col_values.append(col_value_reprs)
+            tabs = [self.pad_single_sentence_for_bert(t, cls=False, sep=False) for t in desc['tables']]
 
             token_list = qs + [c for col in cols for c in col] + \
                          [t for tab in tabs for t in tab]
-            assert self.check_bert_seq(token_list)
+            # assert self.check_bert_seq(token_list)
+            token_pos_list = list(range(len(qs)))
+            for col in cols:
+                start_idx = 2+token_pos_list[-1]
+                token_pos_list += list(range(start_idx,start_idx+len(col)))
+            for tab in tabs:
+                start_idx = 2+token_pos_list[-1]
+                token_pos_list += list(range(start_idx,start_idx+len(tab)))
             if len(token_list) > 512:
                 long_seq_set.add(batch_idx)
                 continue
@@ -830,13 +1100,18 @@ class SpiderEncoderBert(torch.nn.Module):
             table_indexes = \
                 np.cumsum([col_b] + [len(token_list) for token_list in tabs[:-1]]).tolist()
             if self.summarize_header == "avg":
-                column_indexes_2 = \
-                    np.cumsum([q_b - 2] + [len(token_list) for token_list in cols]).tolist()[1:]
-                table_indexes_2 = \
-                    np.cumsum([col_b - 2] + [len(token_list) for token_list in tabs]).tolist()[1:]
-
+                if self.use_column_value:
+                    column_indexes_2 = \
+                        np.cumsum([q_b - 2] + [len(token_list) for token_list in cols]).tolist()[1:]
+                else:
+                    column_indexes_2 = \
+                        np.cumsum([q_b - 1] + [len(token_list) for token_list in cols]).tolist()[1:]
+                table_indexes_2 =   \
+                    np.cumsum([col_b - 1] + [len(token_list) for token_list in tabs]).tolist()[1:]
+            
             indexed_token_list = self.tokenizer.convert_tokens_to_ids(token_list)
             batch_token_lists.append(indexed_token_list)
+            batch_token_pos_list.append(token_pos_list)
 
             question_rep_ids = torch.LongTensor(question_indexes).to(self._device)
             batch_id_to_retrieve_question.append(question_rep_ids)
@@ -857,16 +1132,23 @@ class SpiderEncoderBert(torch.nn.Module):
         padded_token_lists, att_mask_lists, tok_type_lists = self.pad_sequence_for_bert_batch(batch_token_lists)
         tokens_tensor = torch.LongTensor(padded_token_lists).to(self._device)
         att_masks_tensor = torch.LongTensor(att_mask_lists).to(self._device)
-
+        batch_token_pos_list_padded = [x+[0]*(len(padded_token_lists[0])-len(x)) for x in batch_token_pos_list]
+        position_ids = torch.LongTensor(batch_token_pos_list_padded).to(self._device)
+        position_ids[position_ids>511] = 511
+        tokens_embeddings = self.bert_model.embeddings.word_embeddings(tokens_tensor)
+        if self.use_column_value:
+            for batch_idx, col_value_reprs in enumerate(batch_col_values):
+                if batch_idx not in long_seq_set: 
+                    bert_batch_idx = batch_id_map[batch_idx]
+                    tokens_embeddings[bert_batch_idx][batch_id_to_retrieve_column_2[bert_batch_idx]+1] = col_value_reprs
         if self.bert_token_type:
             tok_type_tensor = torch.LongTensor(tok_type_lists).to(self._device)
-            bert_output = self.bert_model(tokens_tensor,
-                                          attention_mask=att_masks_tensor, token_type_ids=tok_type_tensor)[0]
+            bert_output = self.bert_model(inputs_embeds=tokens_embeddings, 
+                attention_mask=att_masks_tensor, token_type_ids=tok_type_tensor, position_ids=position_ids)[0]
         else:
-            bert_output = self.bert_model(tokens_tensor,
-                                          attention_mask=att_masks_tensor)[0]
-
-        enc_output = bert_output
+            bert_output = self.bert_model(inputs_embeds=tokens_embeddings, 
+                attention_mask=att_masks_tensor,position_ids=position_ids)[0]
+        enc_output = self.dropout(bert_output)
 
         column_pointer_maps = [
             {
@@ -904,19 +1186,25 @@ class SpiderEncoderBert(torch.nn.Module):
 
                     col_enc = (col_enc + col_enc_2) / 2.0  # avg of first and last token
                     tab_enc = (tab_enc + tab_enc_2) / 2.0  # avg of first and last token
+                    if self.use_column_value:
+                        col_value_enc = enc_output[bert_batch_idx][batch_id_to_retrieve_column_2[bert_batch_idx]+1]
+                        col_enc = self.fuse_column_value(torch.cat((col_enc, col_value_enc), -1))
+                        col_enc = self.dropout(col_enc)
+                           
 
             assert q_enc.size()[0] == len(desc["question"])
             assert col_enc.size()[0] == c_boundary[-1]
             assert tab_enc.size()[0] == t_boundary[-1]
 
-            q_enc_new_item, c_enc_new_item, t_enc_new_item, align_mat_item = \
+            q_enc_new_item, c_enc_new_item, t_enc_new_item, align_mat_item, relations_t = \
                 self.encs_update.forward_unbatched(
                     desc,
                     q_enc.unsqueeze(1),
                     col_enc.unsqueeze(1),
                     c_boundary,
                     tab_enc.unsqueeze(1),
-                    t_boundary)
+                    t_boundary,
+                    batch_masked_columns[batch_idx])
 
             memory = []
             if 'question' in self.include_in_memory:
@@ -927,13 +1215,19 @@ class SpiderEncoderBert(torch.nn.Module):
                 memory.append(t_enc_new_item)
             memory = torch.cat(memory, dim=1)
 
-            result.append(SpiderEncoderState(
+            result.append(SpiderEncoderStateBert(
                 state=None,
                 memory=memory,
                 question_memory=q_enc_new_item,
+                question_bert_memory=q_enc,
                 schema_memory=torch.cat((c_enc_new_item, t_enc_new_item), dim=1),
                 # TODO: words should match memory
-                words=desc['question'],
+                words=desc.get('question_for_copy', desc['question']),
+                question_word_map=desc.get('question_word_map',{}),
+                pointer_bert_memories={
+                    'column': col_enc,
+                    'table':  tab_enc,
+                },
                 pointer_memories={
                     'column': c_enc_new_item,
                     'table': t_enc_new_item,
@@ -944,6 +1238,13 @@ class SpiderEncoderBert(torch.nn.Module):
                 },
                 m2c_align_mat=align_mat_item[0],
                 m2t_align_mat=align_mat_item[1],
+                relations=relations_t,
+                relation_ids=self.encs_update.relation_ids,
+                bert_pieces=desc['question'],
+                db_id=desc['db_id'],
+                col_labels=torch.LongTensor(desc['col_labels']).to(self._device),
+                question_labels=torch.LongTensor(desc['question_labels']).to(self._device),
+                column2table=desc['column_to_table']
             ))
         return result
 
@@ -987,11 +1288,13 @@ class SpiderEncoderBert(torch.nn.Module):
         else:
             return False
 
-    def pad_single_sentence_for_bert(self, toks, cls=True):
+    def pad_single_sentence_for_bert(self, toks, cls=True, sep=True):
+        padded_toks = toks
         if cls:
-            return [self.tokenizer.cls_token] + toks + [self.tokenizer.sep_token]
-        else:
-            return toks + [self.tokenizer.sep_token]
+            padded_toks = [self.tokenizer.cls_token] + padded_toks
+        if sep:
+            padded_toks = padded_toks + [self.tokenizer.sep_token]
+        return padded_toks
 
     def pad_sequence_for_bert_batch(self, tokens_lists):
         pad_id = self.tokenizer.pad_token_id
@@ -1004,7 +1307,7 @@ class SpiderEncoderBert(torch.nn.Module):
             padded_item_toks = item_toks + [pad_id] * (max_len - len(item_toks))
             toks_ids.append(padded_item_toks)
 
-            _att_mask = [1] * len(item_toks) + [0] * (max_len - len(item_toks))
+            _att_mask = [1 if tok!=self.tokenizer.pad_token else 0 for tok in item_toks] + [0] * (max_len - len(item_toks))
             att_masks.append(_att_mask)
 
             first_sep_id = padded_item_toks.index(self.tokenizer.sep_token_id)
@@ -1012,3 +1315,18 @@ class SpiderEncoderBert(torch.nn.Module):
             _tok_type_list = [0] * (first_sep_id + 1) + [1] * (max_len - first_sep_id - 1)
             tok_type_lists.append(_tok_type_list)
         return toks_ids, att_masks, tok_type_lists
+
+    def pad_sequence_simple(self, tokens_lists, max_l = None):
+        pad_id = self.tokenizer.pad_token_id
+        max_len = max([len(it) for it in tokens_lists])
+        if max_l is not None:
+            max_len = max_len if max_len<=max_l else max_l
+        toks_ids = []
+        att_masks = []
+        for item_toks in tokens_lists:
+            item_toks = item_toks[:max_len]
+            padded_item_toks = item_toks + [pad_id] * (max_len - len(item_toks))
+            _att_mask = [1 if tok!=self.tokenizer.pad_token else 0 for tok in item_toks] + [0] * (max_len - len(item_toks))
+            att_masks.append(_att_mask)
+            toks_ids.append(padded_item_toks)
+        return toks_ids, att_masks
