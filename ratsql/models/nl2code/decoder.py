@@ -1,15 +1,24 @@
+import ast
 import collections
 import collections.abc
 import copy
+import enum
 import itertools
 import json
 import os
+import operator
+import re
+import random
 
+import asdl
 import attr
+import pyrsistent
 import entmax
 import torch
 import torch.nn.functional as F
 
+from ratsql import ast_util
+from ratsql import grammars
 from ratsql.models import abstract_preproc
 from ratsql.models import attention
 from ratsql.models import variational_lstm
@@ -112,9 +121,11 @@ class NL2CodeDecoderPreproc(abstract_preproc.AbstractPreproc):
         if parsed:
             try:
                 self.ast_wrapper.verify_ast(parsed)
-            except AssertionError:
-                return section != 'train', None
-            return True, parsed
+                return True, parsed
+            except:
+                print('********parse exception********')
+                print(item.code)
+                return True, parsed
         return section != 'train', None
 
     def add_item(self, item, section, validation_info):
@@ -134,8 +145,9 @@ class NL2CodeDecoderPreproc(abstract_preproc.AbstractPreproc):
 
     def save(self):
         os.makedirs(self.data_dir, exist_ok=True)
-        self.vocab = self.vocab_builder.finish()
-        self.vocab.save(self.vocab_path)
+        if self.vocab is None:
+            self.vocab = self.vocab_builder.finish()
+            self.vocab.save(self.vocab_path)
 
         for section, items in self.items.items():
             with open(os.path.join(self.data_dir, section + '.jsonl'), 'w') as f:
@@ -322,7 +334,12 @@ class NL2CodeDecoder(torch.nn.Module):
             use_align_mat=False,
             use_align_loss=False,
             enumerate_order=False,
-            loss_type="softmax"):
+            loss_type="softmax",
+            use_encoder_action=False,
+            use_bert_subtask_loss=True,
+            use_rat_subtask_loss=True,
+            bert_subtask_loss_weight=1,
+            rat_subtask_loss_weight=1):
         super().__init__()
         self._device = device
         self.preproc = preproc
@@ -338,6 +355,9 @@ class NL2CodeDecoder(torch.nn.Module):
         self.use_align_mat = use_align_mat
         self.use_align_loss = use_align_loss
         self.enumerate_order = enumerate_order
+        self.use_encoder_action = use_encoder_action
+        self.use_bert_subtask_loss = use_bert_subtask_loss
+        self.use_rat_subtask_loss = use_rat_subtask_loss
 
         if use_align_mat:
             from ratsql.models.spider import spider_dec_func
@@ -345,6 +365,24 @@ class NL2CodeDecoder(torch.nn.Module):
                 spider_dec_func.compute_align_loss(self, *args)
             self.compute_pointer_with_align = lambda *args: \
                 spider_dec_func.compute_pointer_with_align(self, *args)
+        if use_bert_subtask_loss:
+            self.bert_token_cls = torch.nn.Linear(self.enc_recurrent_size, 1)
+            self.bert_column_cls = torch.nn.Linear(2*self.enc_recurrent_size, 5)
+            self.bert_token_query = torch.nn.Linear(self.enc_recurrent_size, self.enc_recurrent_size)
+            self.bert_column_key = torch.nn.Linear(2*self.enc_recurrent_size, self.enc_recurrent_size)
+            self.bert_token_loss = torch.nn.BCEWithLogitsLoss()
+            self.bert_column_loss = torch.nn.BCEWithLogitsLoss()
+            self.bert_token2column_loss = torch.nn.CrossEntropyLoss(ignore_index=-1)
+            self.bert_subtask_loss_weight = bert_subtask_loss_weight
+        if use_rat_subtask_loss:
+            self.rat_token_cls = torch.nn.Linear(self.enc_recurrent_size, 1)
+            self.rat_column_cls = torch.nn.Linear(2*self.enc_recurrent_size, 5)
+            self.rat_token_query = torch.nn.Linear(self.enc_recurrent_size, self.enc_recurrent_size)
+            self.rat_column_key = torch.nn.Linear(2*self.enc_recurrent_size, self.enc_recurrent_size)
+            self.rat_token_loss = torch.nn.BCEWithLogitsLoss()
+            self.rat_column_loss = torch.nn.BCEWithLogitsLoss()
+            self.rat_token2column_loss = torch.nn.CrossEntropyLoss(ignore_index=-1)
+            self.rat_subtask_loss_weight = rat_subtask_loss_weight
 
         if self.preproc.use_seq_elem_rules:
             self.node_type_vocab = vocab.Vocab(
@@ -419,6 +457,9 @@ class NL2CodeDecoder(torch.nn.Module):
                 query_size=self.recurrent_size,
                 key_size=self.enc_recurrent_size,
                 proj_size=50)
+            if self.use_encoder_action:
+                self.copy_pointer_action_emb_proj = torch.nn.Linear(
+                        self.enc_recurrent_size, self.rule_emb_size)
         else:
             # TODO: Figure out how to get right sizes (query, key) to module
             self.copy_pointer = copy_pointer
@@ -510,7 +551,26 @@ class NL2CodeDecoder(torch.nn.Module):
             mle_loss = self.compute_mle_loss(enc_input, example, desc_enc, debug)
         else:
             mle_loss = self.compute_loss_from_all_ordering(enc_input, example, desc_enc, debug)
-
+        column2table = [desc_enc.column2table[str(i)] for i in range(len(desc_enc.column2table))]
+        column2table[0] = 0
+        if self.use_bert_subtask_loss:
+            bert_token_loss = self.bert_token_loss(self.bert_token_cls(desc_enc.question_bert_memory).view(-1,1), (desc_enc.question_labels!=-1).float().view(-1,1))
+            per_col_tab_repr = desc_enc.pointer_bert_memories['table'][column2table,:]
+            per_col_tab_repr[0] = 0.
+            bert_column_repr = torch.cat([desc_enc.pointer_bert_memories['column'],per_col_tab_repr],-1)
+            bert_column_loss = self.bert_column_loss(self.bert_column_cls(bert_column_repr).view(-1,1), desc_enc.col_labels.float().view(-1,1))
+            bert_token_column_mapping_logits = torch.matmul(self.bert_token_query(desc_enc.question_bert_memory), self.bert_column_key(bert_column_repr).transpose(0,1))
+            bert_token2column_loss = self.bert_token2column_loss(bert_token_column_mapping_logits, desc_enc.question_labels.view(-1))
+            mle_loss += self.bert_subtask_loss_weight*(bert_token_loss+bert_column_loss+bert_token2column_loss)
+        if self.use_rat_subtask_loss:
+            rat_token_loss = self.rat_token_loss(self.rat_token_cls(desc_enc.question_memory).view(-1,1), (desc_enc.question_labels!=-1).float().view(-1,1))
+            per_col_tab_repr = desc_enc.pointer_memories['table'][:,column2table,:]
+            per_col_tab_repr[:,0] = 0.
+            rat_column_repr = torch.cat([desc_enc.pointer_memories['column'],per_col_tab_repr],-1)
+            rat_column_loss = self.rat_column_loss(self.rat_column_cls(rat_column_repr).view(-1,1), desc_enc.col_labels.float().view(-1,1))
+            rat_token_column_mapping_logits = torch.matmul(self.rat_token_query(desc_enc.question_memory), self.rat_column_key(rat_column_repr).transpose(1,2))
+            rat_token2column_loss = self.rat_token2column_loss(rat_token_column_mapping_logits.view(-1,rat_token_column_mapping_logits.shape[-1]), desc_enc.question_labels.view(-1))
+            mle_loss += self.rat_subtask_loss_weight*(rat_token_loss+rat_column_loss+rat_token2column_loss)
         if self.use_align_loss:
             align_loss = self.compute_align_loss(desc_enc, example)
             return mle_loss + align_loss
@@ -686,7 +746,7 @@ class NL2CodeDecoder(torch.nn.Module):
         else:
             question_context, question_attention_logits = self.question_attn(query, desc_enc.question_memory)
             schema_context, schema_attention_logits = self.schema_attn(query, desc_enc.schema_memory)
-            return question_context + schema_context, schema_attention_logits
+            return question_context + schema_context, (question_attention_logits, schema_attention_logits)
 
     def _tensor(self, data, dtype=None):
         return torch.tensor(data, dtype=dtype, device=self._device)
@@ -704,6 +764,9 @@ class NL2CodeDecoder(torch.nn.Module):
             desc_enc):
         # desc_context shape: batch (=1) x emb_size
         desc_context, attention_logits = self._desc_attention(prev_state, desc_enc)
+        if self.visualize_flag:
+            attention_weights = F.softmax(attention_logits, dim = -1)
+            print(attention_weights)
         # node_type_emb shape: batch (=1) x emb_size
         node_type_emb = self.node_type_embedding(
             self._index(self.node_type_vocab, node_type))
@@ -771,7 +834,8 @@ class NL2CodeDecoder(torch.nn.Module):
             output,
             gen_logodds,
             token,
-            desc_enc):
+            desc_enc,
+            extra_info):
         # token_idx shape: batch (=1), LongTensor
         token_idx = self._index(self.terminal_vocab, token)
         # action_emb shape: batch (=1) x emb_size
@@ -786,7 +850,7 @@ class NL2CodeDecoder(torch.nn.Module):
         if desc_locs:
             # copy: if the token appears in the description at least once
             # copy_loc_logits shape: batch (=1) x desc length
-            copy_loc_logits = self.copy_pointer(output, desc_enc.memory)
+            copy_loc_logits = self.copy_pointer(output, desc_enc.question_memory)
             copy_logprob = (
                 # log p(copy | output)
                 # shape: batch (=1)
@@ -818,12 +882,23 @@ class NL2CodeDecoder(torch.nn.Module):
             dim=1)
         return loss_piece
 
-    def token_infer(self, output, gen_logodds, desc_enc):
+    def token_infer(self, output, gen_logodds, desc_enc, extra_info):
         # Copy tokens
         # log p(copy | output)
         # shape: batch (=1)
+        last_token, db_id, node_type = extra_info
+        if last_token is not None:
+            last_loc = desc_enc.find_word_occurrences(last_token)
+            tmp = []
+            for loc in last_loc:
+                if loc-1 not in last_loc:
+                    tmp.append(loc)
+            last_loc = tmp
+        else:
+            last_loc = []
+
         copy_logprob = torch.nn.functional.logsigmoid(-gen_logodds)
-        copy_loc_logits = self.copy_pointer(output, desc_enc.memory)
+        copy_loc_logits = self.copy_pointer(output, desc_enc.question_memory)
         # log p(loc_i | copy, output)
         # shape: batch (=1) x seq length
         copy_loc_logprobs = torch.nn.functional.log_softmax(copy_loc_logits, dim=-1)
@@ -835,7 +910,7 @@ class NL2CodeDecoder(torch.nn.Module):
         # multiple times in desc_enc.words.
         accumulate_logprobs(
             log_prob_by_word,
-            zip(desc_enc.words, copy_loc_logprobs.squeeze(0)))
+            [[word, prob] for i, (word, prob) in enumerate(zip(desc_enc.words, copy_loc_logprobs.squeeze(0))) if last_token is None or (i-1 in last_loc and word != last_token)])
 
         # Generate tokens
         # log p(~copy | output)
@@ -851,7 +926,7 @@ class NL2CodeDecoder(torch.nn.Module):
 
         accumulate_logprobs(
             log_prob_by_word,
-            ((self.terminal_vocab[idx], token_logprobs[0, idx]) for idx in range(token_logprobs.shape[1])))
+            ((self.terminal_vocab[idx], token_logprobs[0, idx]) for idx in range(token_logprobs.shape[1]) if (self.terminal_vocab[idx]!='<UNK>' and len(last_loc)==0) or self.terminal_vocab[idx]=='<EOS>'))
 
         return list(log_prob_by_word.items())
 
