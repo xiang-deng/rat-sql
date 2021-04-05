@@ -57,6 +57,9 @@ class EncDecModel(torch.nn.Module):
         
         def dataset(self, section):
             return ZippedDataset(self.enc_preproc.dataset(section), self.dec_preproc.dataset(section))
+        def load_orig_data(self, orig_data):
+            self.enc_preproc.orig_data = orig_data
+            self.dec_preproc.orig_data = orig_data
         
     def __init__(self, preproc, device, encoder, decoder):
         super().__init__()
@@ -64,12 +67,16 @@ class EncDecModel(torch.nn.Module):
         self.encoder = registry.construct(
                 'encoder', encoder, device=device, preproc=preproc.enc_preproc)
         self.decoder = registry.construct(
-                'decoder', decoder, device=device, preproc=preproc.dec_preproc)
+                'decoder', decoder, device=device, preproc=preproc.dec_preproc, encoder=self.encoder)
+        self.decoder.visualize_flag = False
         
         if getattr(self.encoder, 'batched'):
             self.compute_loss = self._compute_loss_enc_batched
         else:
             self.compute_loss = self._compute_loss_unbatched
+
+    def load_orig_data(self, orig_data):
+        self.preproc.load_orig_data(orig_data)
 
     def _compute_loss_enc_batched(self, batch, debug=False):
         losses = []
@@ -113,6 +120,13 @@ class EncDecModel(torch.nn.Module):
 
     def begin_inference(self, orig_item, preproc_item):
         enc_input, _ = preproc_item
+        if self.decoder.visualize_flag:
+            print('question:')
+            print(enc_input['question'])
+            print('columns:')
+            print(enc_input['columns'])
+            print('tables:')
+            print(enc_input['tables'])
         if getattr(self.encoder, 'batched'):
             enc_state, = self.encoder([enc_input])
         else:
