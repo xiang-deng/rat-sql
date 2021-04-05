@@ -7,7 +7,7 @@ from ratsql import datasets
 from ratsql.utils import registry
 
 
-def compute_metrics(config_path, config_args, section, inferred_path, logdir=None):
+def compute_metrics(config_path, config_args, section, inferred_path,logdir=None, infer_type='inferred_code'):
     if config_args:
         config = json.loads(_jsonnet.evaluate_file(config_path, tla_codes={'args': config_args}))
     else:
@@ -26,10 +26,10 @@ def compute_metrics(config_path, config_args, section, inferred_path, logdir=Non
     if len(inferred_lines) < len(data):
         raise Exception(f'Not enough inferred: {len(inferred_lines)} vs {len(data)}')
 
-    for line in inferred_lines:
+    for line in tqdm.tqdm(inferred_lines):
         infer_results = json.loads(line)
         if infer_results['beams']:
-            inferred_code = infer_results['beams'][0]['inferred_code']
+            inferred_code = infer_results['beams'][0][infer_type]
         else:
             inferred_code = None
         if 'index' in infer_results:

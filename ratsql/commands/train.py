@@ -8,13 +8,10 @@ import _jsonnet
 import attr
 import torch
 
-# These imports are needed for registry.lookup
 # noinspection PyUnresolvedReferences
 from ratsql import ast_util
 # noinspection PyUnresolvedReferences
 from ratsql import datasets
-# noinspection PyUnresolvedReferences
-from ratsql import grammars
 # noinspection PyUnresolvedReferences
 from ratsql import models
 # noinspection PyUnresolvedReferences
@@ -101,6 +98,8 @@ class Trainer:
                                             unused_keys=('encoder_preproc', 'decoder_preproc'),
                                             preproc=self.model_preproc, device=self.device)
             self.model.to(self.device)
+            orig_data = registry.construct('dataset', config['data']["train"])
+            self.model.load_orig_data(orig_data)
 
     def train(self, config, modeldir):
         # slight difference here vs. unrefactored train: The init_random starts over here.
@@ -113,11 +112,14 @@ class Trainer:
 
             # TODO: not nice
             if config["optimizer"].get("name", None) == 'bertAdamw':
-                bert_params = list(self.model.encoder.bert_model.parameters())
+                bert_params = []
+                for name, _param in self.model.named_parameters():
+                    if "bert_lm" in name or "bert_model" in name:
+                        bert_params.append(_param)
                 assert len(bert_params) > 0
                 non_bert_params = []
                 for name, _param in self.model.named_parameters():
-                    if "bert" not in name:
+                    if "bert_lm" not in name and "bert_model" not in name:
                         non_bert_params.append(_param)
                 assert len(non_bert_params) + len(bert_params) == len(list(self.model.parameters()))
 
@@ -258,8 +260,8 @@ def main(args):
     else:
         config = json.loads(_jsonnet.evaluate_file(args.config))
 
-    if 'model_name' in config:
-        args.logdir = os.path.join(args.logdir, config['model_name'])
+    # if 'model_name' in config:
+    #     args.logdir = os.path.join(args.logdir, config['model_name'])
 
     # Initialize the logger
     reopen_to_flush = config.get('log', {}).get('reopen_to_flush')

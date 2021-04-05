@@ -1,19 +1,13 @@
 import argparse
 import json
+import os
 
 import _jsonnet
 import tqdm
 
-# These imports are needed for registry.lookup
-# noinspection PyUnresolvedReferences
 from ratsql import datasets
-# noinspection PyUnresolvedReferences
-from ratsql import grammars
-# noinspection PyUnresolvedReferences
 from ratsql import models
-# noinspection PyUnresolvedReferences
 from ratsql.utils import registry
-# noinspection PyUnresolvedReferences
 from ratsql.utils import vocab
 
 
@@ -25,13 +19,20 @@ class Preprocessor:
             config['model'])
 
     def preprocess(self):
+        try:
+            self.model_preproc.load()
+        except:
+            pass
         self.model_preproc.clear_items()
         for section in self.config['data']:
-            data = registry.construct('dataset', self.config['data'][section])
-            for item in tqdm.tqdm(data, desc=f"{section} section", dynamic_ncols=True):
-                to_add, validation_info = self.model_preproc.validate_item(item, section)
-                if to_add:
-                    self.model_preproc.add_item(item, section, validation_info)
+            try:
+                self.model_preproc.dataset(section)
+            except:
+                data = registry.construct('dataset', self.config['data'][section])
+                for item in tqdm.tqdm(data, desc=section, dynamic_ncols=True):
+                    to_add, validation_info = self.model_preproc.validate_item(item, section)
+                    if to_add:
+                        self.model_preproc.add_item(item, section, validation_info)
         self.model_preproc.save()
 
 

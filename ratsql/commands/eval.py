@@ -1,6 +1,8 @@
 import argparse
 import json
 
+import _jsonnet
+import attr
 from ratsql.utils import evaluation
 
 
@@ -17,19 +19,21 @@ def add_parser():
 
 
 def main(args):
-    real_logdir, metrics = evaluation.compute_metrics(args.config, args.config_args, args.section, args.inferred,
-                                                      args.logdir)
+    for infer_type in ['inferred_code', 'oracle_select_inferred_code']:
+        real_logdir, metrics = evaluation.compute_metrics(args.config, args.config_args, args.section, args.inferred, 
+                                                          args.logdir, infer_type=infer_type)
 
-    if args.output:
-        if real_logdir:
-            output_path = args.output.replace('__LOGDIR__', real_logdir)
+        if args.output:
+            if real_logdir:
+                output_path = args.output.replace('__LOGDIR__', real_logdir)
+            else:
+                output_path = args.output
+            output_path = output_path.replace('.eval','_{}.eval'.format(infer_type))
+            with open(output_path, 'w') as f:
+                json.dump(metrics, f)
+            print('Wrote eval results to {}'.format(output_path))
         else:
-            output_path = args.output
-        with open(output_path, 'w') as f:
-            json.dump(metrics, f)
-        print(f'Wrote eval results to {output_path}')
-    else:
-        print(metrics)
+            print(metrics)
 
 
 if __name__ == '__main__':
