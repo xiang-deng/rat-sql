@@ -125,17 +125,26 @@ class SpiderLanguage:
         return unparser.unparse_sql(tree)
 
     @classmethod
-    def tokenize_field_value(cls, field_value):
+    def tokenize_field_value(cls, field_value, tokenizer=None):
         if isinstance(field_value, bytes):
             field_value_str = field_value.encode('latin1')
         elif isinstance(field_value, str):
             field_value_str = field_value
+        elif isinstance(field_value, float):
+            if float(field_value) == int(field_value):
+                field_value_str = str(int(field_value))
+            else:
+                field_value_str = str(float(field_value))
         else:
             field_value_str = str(field_value)
-            if field_value_str[0] == '"' and field_value_str[-1] == '"':
-                field_value_str = field_value_str[1:-1]
+        field_value_str = field_value_str.strip("\"")
+        # regualr expression
+        field_value_str = field_value_str.strip("%")
         # TODO: Get rid of surrounding quotes
-        return [field_value_str]
+        if tokenizer is not None:
+            return tokenizer.tokenize(field_value_str)
+        else:
+            return field_value_str.lower().split()
 
     def parse_val(self, val):
         if isinstance(val, str):
@@ -424,6 +433,8 @@ class SpiderUnparser:
     def unparse_col_unit(self, col_unit):
         if 'col_id' in col_unit:
             column = self.schema.columns[col_unit['col_id']]
+            if column.synonym_for is not None:
+                column = column.synonym_for
             if column.table is None:
                 column_name = column.orig_name
             else:
