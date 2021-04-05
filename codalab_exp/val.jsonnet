@@ -3,8 +3,8 @@
     logdir: "logs/bert_value_run_%d" %exp_id,
     model_config: "codalab_exp/exp/val.jsonnet",
     model_config_args: {
-        data_path: 'tmpdata/',
-        db_path: 'database/',
+        data_path: '/featurestorage/data/spider-20200607/', # 'tmpdata/',
+        db_path: '/featurestorage/data/spider-20200607/database/',
         bs: 8,
         num_batch_accumulated: 3,
         bert_version: "bert-large-uncased-whole-word-masking",
@@ -40,7 +40,7 @@
     eval_name: "val",
     eval_output: "logdirs",
     eval_beam_size: 1,
-    eval_use_heuristic: 0,
+    eval_use_heuristic: true,
     eval_steps: [40000],
     eval_sections: ["val"]
 }

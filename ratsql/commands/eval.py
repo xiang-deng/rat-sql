@@ -19,7 +19,7 @@ def add_parser():
 
 
 def main(args):
-    for infer_type in ['inferred_code', 'oracle_select_inferred_code']:
+    for infer_type in ['inferred_code']:#  optionally using oracle select'oracle_select_inferred_code'
         real_logdir, metrics = evaluation.compute_metrics(args.config, args.config_args, args.section, args.inferred, 
                                                           args.logdir, infer_type=infer_type)
 

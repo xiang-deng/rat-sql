@@ -86,7 +86,7 @@ class Inferer:
             
 
     def _inner_infer(self, model, beam_size, output_history, sliced_orig_data, sliced_preproc_data, output,
-                     use_heuristic=False):
+                     use_heuristic=True):
         for i, (orig_item, preproc_item) in enumerate(
                 tqdm.tqdm(zip(sliced_orig_data, sliced_preproc_data),
                           total=len(sliced_orig_data))):
@@ -98,7 +98,7 @@ class Inferer:
                 }) + '\n')
             output.flush()
 
-    def _infer_one(self, model, data_item, preproc_item, beam_size, output_history=False, use_heuristic=False):
+    def _infer_one(self, model, data_item, preproc_item, beam_size, output_history=False, use_heuristic=True):
         if use_heuristic:
             # TODO: from_cond should be true from non-bert model
             beams = spider_beam_search.beam_search_with_heuristics(

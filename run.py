@@ -123,10 +123,10 @@ def main():
                     )
                     eval.main(eval_config)
                     print(section)
-                    for infer_type in ['inferred_code', 'oracle_select_inferred_code']:
+                    for infer_type in ['inferred_code']:
                         print(infer_type)
                         res_json = json.load(open(eval_output_path.replace('.eval','_{}.eval'.format(infer_type))))
-                        print('%.4f %.4f %.4f,'%(res_json['total_scores']['all']['exact'], res_json['total_scores']['all']['exec'], res_json['total_scores']['all']['exec (non empty)']))
+                        print('exact match: %.4f exec acc: %.4f,'%(res_json['total_scores']['all']['exact'], res_json['total_scores']['all']['exec']))
 
 
 if __name__ == "__main__":

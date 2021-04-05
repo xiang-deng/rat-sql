@@ -2,6 +2,7 @@ import json
 import os
 
 import _jsonnet
+import tqdm
 
 from ratsql import datasets
 from ratsql.utils import registry
