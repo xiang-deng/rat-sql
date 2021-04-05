@@ -1,7 +1,21 @@
+import ast
+import collections
+import collections.abc
 import enum
+import itertools
+import json
+import os
+import operator
+import re
+import copy
+import random
 
+import asdl
 import attr
 import pyrsistent
+import entmax
+import torch
+import torch.nn.functional as F
 
 from ratsql.models.nl2code import decoder
 from ratsql.utils import vocab
@@ -57,6 +71,10 @@ class TreeTraversal:
             return
 
         self.model = model
+        try:
+            vocab.EOS = self.model.tokenizer.eos_token
+        except:
+            pass
         self.desc_enc = desc_enc
 
         model.state_update.set_dropout_masks(batch_size=1)
@@ -117,6 +135,16 @@ class TreeTraversal:
     ):
         if last_choice is None:
             return
+        if self.model.visualize_flag:
+            print("cur_item.state", self.cur_item.state)
+            if (
+                self.cur_item.state == TreeTraversal.State.SUM_TYPE_APPLY
+                or self.cur_item.state == TreeTraversal.State.CHILDREN_APPLY
+                or self.cur_item.state == TreeTraversal.State.LIST_LENGTH_APPLY
+            ):
+                print("last choice", self.model.preproc.all_rules[last_choice])
+            else:
+                print("last choice", last_choice)
         self.update_prev_action_emb(self, last_choice, extra_choice_info)
 
     @classmethod
@@ -127,9 +155,13 @@ class TreeTraversal:
     @classmethod
     def _update_prev_action_emb_gen_token(cls, self, last_choice, extra_choice_info):
         # token_idx shape: batch (=1), LongTensor
-        token_idx = self.model._index(self.model.terminal_vocab, last_choice)
-        # action_emb shape: batch (=1) x emb_size
-        self.prev_action_emb = self.model.terminal_embedding(token_idx)
+        last_choice_locs = self.desc_enc.question_word_map.get(last_choice,[])
+        if last_choice_locs and self.model.use_encoder_action:
+            self.prev_action_emb = self.model.copy_pointer_action_emb_proj(self.desc_enc.question_memory[:, last_choice_locs[0]])
+        else:
+            token_idx = self.model._index(self.model.terminal_vocab, last_choice)
+            # action_emb shape: batch (=1) x emb_size
+            self.prev_action_emb = self.model.terminal_embedding(token_idx)
 
     @classmethod
     def _update_prev_action_emb_pointer(cls, self, last_choice, extra_choice_info):
@@ -361,7 +393,7 @@ class TreeTraversal:
         self.update_prev_action_emb = (
             TreeTraversal._update_prev_action_emb_gen_token
         )
-        choices = self.token_choice(output, gen_logodds)
+        choices = self.token_choice(output, gen_logodds, extra_info=[last_choice,self.desc_enc.db_id,self.cur_item.node_type])
         return choices, False
 
     @Handler.register_handler(State.POINTER_INQUIRE)
@@ -385,7 +417,10 @@ class TreeTraversal:
         choices = self.pointer_choice(
             self.cur_item.node_type, logits, attention_logits
         )
-        return choices, False
+        if self.cur_item.node_type == 'column':
+            return (choices, attention_logits), False
+        else:
+            return choices, False
 
     @Handler.register_handler(State.POINTER_APPLY)
     def process_pointer_apply(self, last_choice):

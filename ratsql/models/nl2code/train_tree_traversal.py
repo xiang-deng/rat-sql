@@ -1,8 +1,21 @@
+import ast
+import collections
+import collections.abc
+import enum
+import itertools
+import json
+import os
 import operator
+import re
+import copy
+import random
 
+import asdl
 import attr
 import pyrsistent
+import entmax
 import torch
+import torch.nn.functional as F
 
 from ratsql.models.nl2code.tree_traversal import TreeTraversal
 
@@ -40,7 +53,8 @@ class TrainTreeTraversal(TreeTraversal):
                     self.lstm_output,
                     self.gen_logodds,
                     token,
-                    outer.desc_enc)
+                    outer.desc_enc,
+                    extra_tokens)
 
     def __init__(self, model, desc_enc, debug=False):
         super().__init__(model, desc_enc)
@@ -73,7 +87,7 @@ class TrainTreeTraversal(TreeTraversal):
             self.history = self.history.append(
                     ChoiceHistoryEntry(node_type, choices, probs, None))
 
-    def token_choice(self, output, gen_logodds):
+    def token_choice(self, output, gen_logodds, extra_info=None):
         self.choice_point = self.TokenChoicePoint(output, gen_logodds)
     
     def pointer_choice(self, node_type, logits, attention_logits):

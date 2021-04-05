@@ -1,6 +1,21 @@
+import ast
+import collections
+import collections.abc
+import enum
+import itertools
+import json
+import os
+import operator
+import re
+import copy
+import random
+
+import asdl
 import attr
 import pyrsistent
+import entmax
 import torch
+import torch.nn.functional as F
 
 from ratsql.models.nl2code.tree_traversal import TreeTraversal
 from ratsql.utils import vocab
@@ -35,14 +50,14 @@ class InferenceTreeTraversal(TreeTraversal):
         pass
 
     SIMPLE_TERMINAL_TYPES = {
-        'str': str,
+        'str': lambda n: '\"%s\"'%str(n),
         'int': int,
-        'float': float,
-        'bool': lambda n: {'True': True, 'False': False}.get(n, False),
+        'float': lambda n: float(n) if float(n)!=int(n) else int(n),
+        'bool': lambda n: {'True': True, 'False': False, 'true': True, 'false': False}.get(n, False),
     }
  
     SIMPLE_TERMINAL_TYPES_DEFAULT = {
-        'str': '',
+        'str': '\"\"',
         'int': 0,
         'float': 0,
         'bool': True,
@@ -62,8 +77,8 @@ class InferenceTreeTraversal(TreeTraversal):
     def rule_choice(self, node_type, rule_logits):
         return self.model.rule_infer(node_type, rule_logits)
 
-    def token_choice(self, output, gen_logodds):
-        return self.model.token_infer(output, gen_logodds, self.desc_enc)
+    def token_choice(self, output, gen_logodds, extra_info=None):
+        return self.model.token_infer(output, gen_logodds, self.desc_enc, extra_info=extra_info)
 
     def pointer_choice(self, node_type, logits, attention_logits):
         # Group them based on pointer map
@@ -120,8 +135,9 @@ class InferenceTreeTraversal(TreeTraversal):
         elif self.cur_item.state == TreeTraversal.State.NODE_FINISHED:
             self.actions = self.actions.append(self.NodeFinished())
 
-    def finalize(self):
+    def finalize(self, gold=None, oracle=[]):
         root = current = None
+        gold = self.model.preproc.grammar.parse(gold, 'val')
         stack = []
         for i, action in enumerate(self.actions):
             if isinstance(action, self.SetParentField):
@@ -158,13 +174,17 @@ class InferenceTreeTraversal(TreeTraversal):
                 tokens.append(action.value)
 
             elif isinstance(action, self.FinalizeTerminal):
-                terminal = ''.join(current.get(action.parent_field_name, []))
+                try:
+                    terminal = self.model.tokenizer.convert_tokens_to_string(current.get(action.parent_field_name, []))
+                except:
+                    terminal = ' '.join(current.get(action.parent_field_name, []))
                 constructor = self.SIMPLE_TERMINAL_TYPES.get(action.terminal_type)
                 if constructor:
                     try:
                         value = constructor(terminal)
                     except ValueError:
                         value = self.SIMPLE_TERMINAL_TYPES_DEFAULT[action.terminal_type]
+                        print('expect type %s, get %s'%(action.terminal_type, terminal))
                 elif action.terminal_type == 'bytes':
                     value = terminal.decode('latin1')
                 elif action.terminal_type == 'NoneType':
@@ -180,5 +200,7 @@ class InferenceTreeTraversal(TreeTraversal):
                 raise ValueError(action)
 
         assert not stack
+        for clause in oracle:
+            root[clause] = gold[clause]
         return root, self.model.preproc.grammar.unparse(root, self.example)
 
